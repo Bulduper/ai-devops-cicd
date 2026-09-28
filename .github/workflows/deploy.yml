@@ -1,0 +1,142 @@
+name: Deploy quotes-api
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Zaczynamy od "deny by default": każdy job dostaje tylko to, co jawnie
+# wymienimy niżej. Zob. docs/github-actions-permissions.md.
+permissions: {}
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: quotes-api
+  EKS_CLUSTER: szkolenie-ai-devops
+
+jobs:
+  # Job czyta tylko kod repozytorium (actions/checkout) i nic więcej nie robi
+  # na zewnątrz — wystarczy `contents: read`.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --no-cache-dir -r app/requirements-dev.txt
+      - run: ruff check app/
+
+  # Tak samo jak lint — tylko odczyt kodu, testy uruchamiają się lokalnie
+  # na runnerze i niczego nie publikują.
+  test:
+    name: Testy (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: lint
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --no-cache-dir -r app/requirements-dev.txt
+      - run: pytest app/tests
+
+  # Buduje obraz i wypycha go do ECR — potrzebuje `id-token: write`, żeby
+  # wymienić token OIDC na krótkotrwałe poświadczenia AWS przez
+  # aws-actions/configure-aws-credentials (trust policy roli decyduje, co
+  # wolno zrobić dalej). `contents: read` tylko dla checkoutu. Bez
+  # `packages: write` czy innych zakresów — ten job nie dotyka GitHuba,
+  # tylko AWS.
+  build:
+    name: Build i push do ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnienie do AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Logowanie do ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build i push obrazu
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${TAG}"
+          docker build \
+            --build-arg APP_VERSION="${TAG}" \
+            -t "${IMAGE}" \
+            -f app/Dockerfile app
+          docker push "${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+  # Wdraża na EKS. `id-token: write` z tego samego powodu co w build —
+  # potrzebny do zalogowania się do klastra przez aws eks
+  # update-kubeconfig. `contents: read` tylko po to, żeby zaciągnąć
+  # manifesty z app/k8s-dzien1/ przez checkout. Celowo bez bloku
+  # `environment:` — zmieniłby claim w tokenie OIDC i złamał trust policy
+  # roli (patrz labs/lab02, „Podpowiedź 4").
+  deploy:
+    name: Deploy na EKS
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Uwierzytelnienie do AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Konfiguracja kubeconfig dla EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name "${EKS_CLUSTER}" \
+            --region "${AWS_REGION}"
+
+      - name: Wdrożenie manifestów z app/k8s-dzien1/
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          sed "s|PODMIEN_NA_OBRAZ|${IMAGE}|" app/k8s-dzien1/deployment.yaml \
+            | kubectl apply -n "${NAMESPACE}" -f -
+          kubectl apply -n "${NAMESPACE}" -f app/k8s-dzien1/service.yaml
+
+      - name: Oczekiwanie na gotowość Deployment
+        env:
+          NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          kubectl rollout status deployment/quotes-api-d1 \
+            -n "${NAMESPACE}" --timeout=180s
